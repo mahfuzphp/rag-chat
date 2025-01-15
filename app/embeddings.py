@@ -1,6 +1,4 @@
 
-# File: app/embeddings.py
-# Purpose: Text embedding generation
 from sentence_transformers import SentenceTransformer
 from typing import List
 

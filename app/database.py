@@ -1,12 +1,16 @@
 
-# File: app/database.py
-# Purpose: Database connection and operations
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams
 
 class Database:
+    
     def __init__(self, host: str = "localhost"):
-        self.client = QdrantClient(host=host)
+        # Get port from environment or default to 5433
+        port = int(os.getenv("POSTGRES_PORT", 5433))
+        self.client = QdrantClient(
+            host=host,
+            port=port
+        )
         
     def init_collection(self, collection_name: str, vector_size: int):
         self.client.recreate_collection(
