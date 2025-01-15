@@ -1,15 +1,20 @@
-# This configuration creates a separate PostgreSQL instance on port 5434
+# docker-compose.yml
+
 version: '3.8'
+
 services:
+  # Main application service that runs our FastAPI server
   app:
-    build: .
+    build: 
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "8008:8008"
     volumes:
       - ./app:/app
       - ./data:/data
+      - ./logs:/app/logs
     environment:
-      # We use 5434 inside the container network
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=ragdb
@@ -17,34 +22,54 @@ services:
       - POSTGRES_PASSWORD=ragpass
       - QDRANT_HOST=qdrant
     depends_on:
-      - postgres
-      - qdrant
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks:
+      - rag_network
+    restart: unless-stopped
 
+  # PostgreSQL service for storing document metadata
   postgres:
     image: postgres:13
     ports:
-      # Map container's 5432 to host's 5434
-      - "5434:5432"
+      - "5435:5432"  # Map container's 5432 to host's 5435
     environment:
       - POSTGRES_DB=ragdb
       - POSTGRES_USER=raguser
       - POSTGRES_PASSWORD=ragpass
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    # Add healthcheck to ensure database is ready
+    networks:
+      - rag_network
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
+  # Qdrant vector database for storing embeddings
   qdrant:
     image: qdrant/qdrant:latest
     ports:
       - "6333:6333"
     volumes:
       - qdrant_data:/qdrant/storage
+    networks:
+      - rag_network
+    restart: unless-stopped
 
+# Define named volumes for persistent storage
 volumes:
   postgres_data:
+    name: rag_postgres_data
   qdrant_data:
+    name: rag_qdrant_data
+
+# Create a dedicated network for our services
+networks:
+  rag_network:
+    name: rag_network
+    driver: bridge
