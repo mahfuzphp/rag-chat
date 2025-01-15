@@ -8,12 +8,13 @@ RUN apt-get update && \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install dependencies
+# Copy requirements first to leverage Docker cache
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the app directory
-COPY app/ .
+# Copy application code
+COPY . .
 
-# The important change is here - we modify how we run uvicorn
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8008", "--reload"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8008", "--reload"]
