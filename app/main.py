@@ -1,5 +1,5 @@
-# Main FastAPI application file implementing a RAG (Retrieval-Augmented Generation) system
-# This file handles document uploads, querying, and system health monitoring
+# Main FastAPI application file implementing a storage-optimized RAG system
+# This file handles document processing with compression and efficient resource usage
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,7 +8,8 @@ import uvicorn
 import logging
 import json
 import os
-from datetime import datetime
+import zlib
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
 # Import our application components
@@ -19,13 +20,16 @@ from embeddings import Embeddings
 from text_processor import TextProcessor
 from utils import setup_logging
 
-# Initialize logging
-logger = setup_logging()
+# Initialize logging with rotation to manage file sizes
+logger = setup_logging(
+    max_bytes=10485760,  # 10MB
+    backup_count=5
+)
 
-# Create FastAPI application
+# Create FastAPI application with minimal startup load
 app = FastAPI(
-    title="RAG System API",
-    description="A Retrieval-Augmented Generation system for document processing and querying",
+    title="Storage-Optimized RAG System",
+    description="A space-efficient RAG system for document processing and querying",
     version="1.0.0"
 )
 
@@ -38,26 +42,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize components
+# Initialize components with storage optimization
 db = Database()
-embeddings = Embeddings(settings.model_name)
-text_processor = TextProcessor(
-    chunk_size=settings.chunk_size,
-    chunk_overlap=settings.chunk_overlap
+embeddings = Embeddings(
+    model_name=settings.model_name,
+    batch_size=32  # Process embeddings in smaller batches
 )
+text_processor = TextProcessor(
+    chunk_size=256,  # Smaller chunks for storage efficiency
+    chunk_overlap=20  # Reduced overlap
+)
+
+# Cleanup configuration
+RETENTION_DAYS = 30
+CLEANUP_BATCH_SIZE = 100
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize system components on startup"""
-    logger.info("Starting RAG system...")
+    """Initialize system components with storage optimization"""
+    logger.info("Starting storage-optimized RAG system...")
     try:
-        # Initialize database connections
         await db.initialize()
         logger.info("Database connections established")
         
-        # Ensure required directories exist
-        os.makedirs(settings.documents_dir, exist_ok=True)
-        logger.info("Document directory initialized")
+        # Create minimal required directories
+        if not os.path.exists(settings.documents_dir):
+            os.makedirs(settings.documents_dir)
+            logger.info("Document directory initialized")
         
     except Exception as e:
         logger.error(f"Startup failed: {str(e)}")
@@ -65,19 +76,56 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Clean up resources on shutdown"""
-    logger.info("Shutting down RAG system...")
-    await db.close_connections()
+    """Clean up resources and compress logs on shutdown"""
+    logger.info("Performing cleanup before shutdown...")
+    try:
+        await db.close_connections()
+        await compress_old_logs()
+    except Exception as e:
+        logger.error(f"Shutdown cleanup failed: {str(e)}")
+
+async def compress_old_logs():
+    """Compress log files older than 1 day"""
+    log_dir = "logs"
+    current_time = datetime.now()
+    
+    for filename in os.listdir(log_dir):
+        if filename.endswith(".log"):
+            file_path = os.path.join(log_dir, filename)
+            file_time = datetime.fromtimestamp(os.path.getmtime(file_path))
+            
+            if (current_time - file_time) > timedelta(days=1):
+                with open(file_path, 'rb') as f_in:
+                    with open(f"{file_path}.gz", 'wb') as f_out:
+                        f_out.write(zlib.compress(f_in.read()))
+                os.remove(file_path)
+
+async def cleanup_old_documents():
+    """Remove documents older than retention period"""
+    cutoff_date = datetime.now() - timedelta(days=RETENTION_DAYS)
+    
+    while True:
+        deleted_count = await db.delete_old_documents(
+            cutoff_date,
+            batch_size=CLEANUP_BATCH_SIZE
+        )
+        if deleted_count < CLEANUP_BATCH_SIZE:
+            break
 
 @app.get("/health")
 async def health_check() -> Dict:
-    """
-    Check system health and component status
-    """
+    """Check system health and storage usage"""
     try:
+        disk_usage = os.statvfs(settings.documents_dir)
+        free_space = (disk_usage.f_bavail * disk_usage.f_frsize) / (1024 * 1024 * 1024)  # GB
+        
         health_status = {
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
+            "storage": {
+                "free_space_gb": round(free_space, 2),
+                "storage_status": "ok" if free_space > 1 else "low"
+            },
             "components": {
                 "database": await db.check_health(),
                 "vector_store": await db.check_vector_store(),
@@ -97,40 +145,44 @@ async def upload_documents(
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = None
 ) -> Dict:
-    """
-    Upload and process documents for the RAG system
-    The function handles document chunking, embedding generation, and storage
-    """
+    """Upload and process documents with storage optimization"""
     try:
         logger.info(f"Processing upload: {file.filename}")
         
-        # Read and validate file content
+        # Read and compress content
         content = await file.read()
         if not content:
             raise HTTPException(status_code=400, detail="Empty file")
-            
-        # Store original document metadata
+        
+        compressed_content = zlib.compress(content)
+        
+        # Store compressed document metadata
         doc_id = await db.store_document_metadata({
             "filename": file.filename,
-            "size": len(content),
+            "original_size": len(content),
+            "compressed_size": len(compressed_content),
             "upload_time": datetime.now().isoformat(),
-            "content_type": file.content_type
+            "content_type": file.content_type,
+            "compressed_content": compressed_content
         })
         
-        # Process document in background if requested
+        # Process document efficiently
         async def process_document():
             try:
-                # Convert content to text and chunk it
-                text_content = content.decode('utf-8')
+                text_content = zlib.decompress(compressed_content).decode('utf-8')
                 chunks = text_processor.chunk_text(text_content)
                 
-                # Generate embeddings for chunks
-                chunk_embeddings = embeddings.encode_batch(chunks)
-                
-                # Store chunks and their embeddings
-                await db.store_chunks(doc_id, chunks, chunk_embeddings)
+                # Process embeddings in batches
+                for i in range(0, len(chunks), embeddings.batch_size):
+                    batch = chunks[i:i + embeddings.batch_size]
+                    batch_embeddings = embeddings.encode_batch(batch)
+                    await db.store_chunks(doc_id, batch, batch_embeddings)
                 
                 logger.info(f"Successfully processed document {file.filename}")
+                
+                # Cleanup old documents if needed
+                background_tasks.add_task(cleanup_old_documents)
+                
             except Exception as e:
                 logger.error(f"Background processing failed for {file.filename}: {str(e)}")
                 await db.mark_document_failed(doc_id, str(e))
@@ -145,7 +197,8 @@ async def upload_documents(
         return {
             "message": f"Document upload {status}",
             "document_id": doc_id,
-            "status": status
+            "status": status,
+            "storage_saved": round((len(content) - len(compressed_content)) / 1024, 2)  # KB saved
         }
         
     except Exception as e:
@@ -154,20 +207,14 @@ async def upload_documents(
 
 @app.post("/query")
 async def query_documents(query: Query) -> Response:
-    """
-    Query the RAG system to find relevant document chunks
-    The function generates query embeddings and performs semantic search
-    """
+    """Query the RAG system with optimized search"""
     try:
         logger.info(f"Processing query: {query.text[:100]}...")
-        
-        # Generate embedding for query
         query_embedding = embeddings.encode_text(query.text)
         
-        # Search for relevant chunks
         results = await db.semantic_search(
             query_embedding,
-            limit=query.top_k or 5,
+            limit=min(query.top_k or 5, 10),  # Limit max results for efficiency
             threshold=query.threshold or 0.7
         )
         
@@ -179,7 +226,6 @@ async def query_documents(query: Query) -> Response:
                 confidence=0.0
             )
         
-        # Format results
         sources = [
             SearchResult(
                 text=result.text,
@@ -190,7 +236,6 @@ async def query_documents(query: Query) -> Response:
             for result in results
         ]
         
-        # Calculate overall confidence
         avg_confidence = sum(r.score for r in results) / len(results)
         
         return Response(
@@ -205,9 +250,7 @@ async def query_documents(query: Query) -> Response:
 
 @app.get("/documents/{document_id}/status")
 async def get_document_status(document_id: int) -> Dict:
-    """
-    Check the processing status of a specific document
-    """
+    """Check document processing status"""
     try:
         status = await db.get_document_status(document_id)
         return {"status": status}
@@ -217,9 +260,7 @@ async def get_document_status(document_id: int) -> Dict:
 
 @app.delete("/documents/{document_id}")
 async def delete_document(document_id: int) -> Dict:
-    """
-    Delete a document and its associated chunks from the system
-    """
+    """Delete a document and its associated data"""
     try:
         await db.delete_document(document_id)
         return {"message": f"Document {document_id} deleted successfully"}

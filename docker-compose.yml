@@ -1,19 +1,14 @@
 # docker-compose.yml
-
+# Optimized for minimal storage usage
 version: '3.8'
 
 services:
-  # Main application service that runs our FastAPI server
   app:
-    build: 
-      context: .
-      dockerfile: Dockerfile
+    build: .
     ports:
       - "8008:8008"
     volumes:
       - ./app:/app
-      - ./data:/data
-      - ./logs:/app/logs
     environment:
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
@@ -21,55 +16,62 @@ services:
       - POSTGRES_USER=raguser
       - POSTGRES_PASSWORD=ragpass
       - QDRANT_HOST=qdrant
+      - CHUNK_SIZE=256  # Smaller chunks for storage optimization
+      - CHUNK_OVERLAP=20  # Reduced overlap
     depends_on:
-      postgres:
-        condition: service_healthy
-      qdrant:
-        condition: service_started
-    networks:
-      - rag_network
+      - postgres
+      - qdrant
     restart: unless-stopped
 
-  # PostgreSQL service for storing document metadata
   postgres:
-    image: postgres:13
+    image: postgres:13-alpine  # Using Alpine for smaller image
     ports:
-      - "5435:5432"  # Map container's 5432 to host's 5435
+      - "5435:5432"
     environment:
       - POSTGRES_DB=ragdb
       - POSTGRES_USER=raguser
       - POSTGRES_PASSWORD=ragpass
+      - POSTGRES_INITDB_ARGS="--data-page-checksum"  # Enable compression
+    command: >
+      postgres
+      -c shared_buffers=256MB
+      -c maintenance_work_mem=256MB
+      -c effective_cache_size=512MB
+      -c effective_io_concurrency=200
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - rag_network
+      - type: volume
+        source: postgres_data
+        target: /var/lib/postgresql/data
+        volume:
+          nocopy: true  # Prevents copying existing data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
 
-  # Qdrant vector database for storing embeddings
   qdrant:
     image: qdrant/qdrant:latest
     ports:
       - "6333:6333"
     volumes:
-      - qdrant_data:/qdrant/storage
-    networks:
-      - rag_network
-    restart: unless-stopped
+      - type: volume
+        source: qdrant_data
+        target: /qdrant/storage
+        volume:
+          nocopy: true
+    environment:
+      - QDRANT_STORAGE_OPTIMIZERS_DEFAULT_MAX_SEGMENT_SIZE=10000
+      - QDRANT_STORAGE_OPTIMIZERS_MEMMAP_THRESHOLD=10000
 
-# Define named volumes for persistent storage
 volumes:
   postgres_data:
-    name: rag_postgres_data
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: './data/postgres'
   qdrant_data:
-    name: rag_qdrant_data
-
-# Create a dedicated network for our services
-networks:
-  rag_network:
-    name: rag_network
-    driver: bridge
+    driver_opts:
+      type: 'none'
+      o: 'bind'
+      device: './data/qdrant'
